@@ -1,0 +1,147 @@
+#!/bin/bash
+
+function has_string() {
+  local file="$1"
+  local string="$2"
+
+  grep -Eo "$string" "$file"
+  return $?
+}
+
+function get_header_file_list_including() {
+  local string="$1"
+  grep -nr "$1" * | grep -Eo ".*\.h:" | grep -Eo ".*\.h" | uniq
+}
+
+function get_cpp_file_list_including() {
+  local string="$1"
+  grep -nr "$1" * | grep -Eo ".*(\.cc|\.mm):" | grep -Eo ".*(\.cc|\.mm)" | uniq
+}
+
+function replace_string() {
+  local file="$1"
+  local old="$2"
+  local new="$3"
+
+  vi -c "%s/$old/$new/g" -c ":wq" $file
+}
+
+function has_wrap_unique() {
+  local file="$1"
+  has_string "$file" "base::WrapUnique"
+}
+
+function has_memory_header() {
+  local file="$1"
+  has_string "$file" "#include <memory>"
+}
+
+function remove_ptr_util() {
+  local file="$1"
+  replace_string $file "#include \"base\/memory\/ptr_util.h\"\n" ""
+}
+
+function add_memory_header_in_cpp_style() {
+  local file="$1"
+  vi -c "/#include <\(.*[^\.h]\)>/s/#include <\(.*[^\.h]\)>/#include <memory>\r#include <\1>/g" -c ":wq" $file
+}
+
+function add_memory_header_below_c_style() {
+  local file="$1"
+  vi -c "%s/#include <\(.*\.h\)>\n\n/#include <\1>\r\r#include <memory>\r\r/g" -c ":wq" $file
+}
+
+function add_memory_header_above_custom_header() {
+  local file="$1"
+  vi -c "/#include \"/s/\(#include.*\n\)/#include <memory>\r\r\1/g" -c ":wq" $file
+}
+
+function add_memory_header_below_related_header() {
+  local file="$1"
+  local related_header="$(basename $(get_related_header $file))"
+  vi -c "/#include \"/s/\(#include \".*$related_header\"\n\)/\1\r#include <memory>\r/g" -c ":wq" $file
+}
+
+function has_related_header() {
+  local file="$1"
+  has_string "$file" "$(get_related_header $file)"
+}
+
+function get_related_header() {
+  local file="$1"
+  echo $file | sed "s/_unittest\./\./g" | sed "s/_browsertest\./\./g" | sed "s/\.[c|m][c|m]$/\.h/g"
+}
+
+# Process header files
+for file in $(get_header_file_list_including "base::MakeUnique"); do
+  replace_string $file "base::MakeUnique" "std::make_unique"
+  if ! has_wrap_unique $file; then
+    remove_ptr_util $file 
+  fi
+
+  if ! has_memory_header $file; then
+    add_memory_header_in_cpp_style $file
+  fi
+
+  if ! has_memory_header $file; then
+    add_memory_header_below_c_style $file
+  fi
+
+  if ! has_memory_header $file; then
+    add_memory_header_above_custom_header $file
+  fi
+done
+
+# Process cpp files
+for file in $(get_cpp_file_list_including "base::MakeUnique"); do
+  replace_string $file "base::MakeUnique" "std::make_unique"
+  if ! has_wrap_unique $file; then
+    remove_ptr_util $file 
+  fi
+
+  if has_related_header $file; then
+    if has_memory_header $(get_related_header $file); then
+      continue
+    fi
+  fi
+
+  if ! has_memory_header $file; then
+    add_memory_header_in_cpp_style $file
+  fi
+
+  if ! has_memory_header $file; then
+    add_memory_header_below_c_style $file
+  fi
+
+  if ! has_memory_header $file; then
+    add_memory_header_below_related_header $file
+  fi
+
+  if ! has_memory_header $file; then
+    add_memory_header_above_custom_header $file
+  fi
+done
+
+git cl format
+
+git commit -a -m "$(basename $(pwd)): Replace base::MakeUnique with std::make_unique
+
+Should use std::make_unique directly instead of using base::MakeUnique
+since August[1]. So, this change removes usages of base::MakeUnique in
+//chrome/browser/$(basename $(pwd)).
+
+This change removes \`#include \"base/memory/ptr_util.h\"\` if it's no more
+used in files. (Might not remove if base::WrapUnique is used)
+
+This change also adds \`#include <memory>\` header except the following
+two cases:
+  - Not add the header if the file contains the <memory> header
+  - Not add the header if the related header contains <memory> header
+    (The style guide[2] says that foo.cc can rely on foo.h's includes)
+
+Confirmed no additional lint errors(by \`git cl lint\`) after this change.
+
+[1] https://chromium-review.googlesource.com/c/chromium/src/+/616016
+[2] https://google.github.io/styleguide/cppguide.html#Names_and_Order_of_Includes
+
+Bug: 755727"
